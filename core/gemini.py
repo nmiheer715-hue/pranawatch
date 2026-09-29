@@ -186,3 +186,53 @@ def write_alert(ctx: dict, use_gemini: bool = True) -> dict:
             fb["_model"] = f"template (Gemini error: {str(e)[:120]})"
             return fb
     return template_alert(ctx)
+
+
+# ---------------------------------------------------------------------------
+# Voice advisories (Gemini text-to-speech)
+# ---------------------------------------------------------------------------
+
+TTS_MODELS = ["gemini-2.5-flash-preview-tts", "gemini-2.5-flash-tts"]
+
+
+def _pcm_to_wav(pcm: bytes, rate: int = 24000) -> bytes:
+    import io
+    import wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def speak(text: str, voice: str = "Kore") -> tuple[bytes, str]:
+    """Return (wav_bytes, model) for a spoken advisory. Raises if TTS is unavailable."""
+    from google import genai
+    from google.genai import types
+
+    models = ([os.environ["GEMINI_TTS_MODEL"]] if os.environ.get("GEMINI_TTS_MODEL") else []) + TTS_MODELS
+    cfg = types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice))))
+    last = None
+    for backend in ("gemini-api", "vertex"):
+        client = genai.Client(api_key=_key()) if backend == "gemini-api" else genai.Client(vertexai=True, api_key=_key())
+        for model in models:
+            try:
+                resp = client.models.generate_content(
+                    model=model, contents=f"Read this public health advisory clearly and calmly: {text}", config=cfg)
+                part = resp.candidates[0].content.parts[0]
+                data = part.inline_data.data
+                mime = part.inline_data.mime_type or ""
+                if "wav" in mime:
+                    return data, model
+                rate = 24000
+                if "rate=" in mime:
+                    try:
+                        rate = int(mime.split("rate=")[1].split(";")[0])
+                    except ValueError:
+                        pass
+                return _pcm_to_wav(data, rate), model
+            except Exception as e:
+                last = e
+    raise RuntimeError(f"Gemini voice unavailable: {str(last)[:160]}")

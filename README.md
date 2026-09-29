@@ -34,6 +34,19 @@ Pilot corridor: **Peenya Industrial Area, Bengaluru**.
 | Alert authorities | **Gemini** writes an evidence-backed alert to KSPCB / BBMP / Traffic Police + public advisory in **English, ಕನ್ನಡ, हिन्दी** |
 | Interoperable, share predictive models | **Federated learning (FedAvg)**: weights only, no raw data; **OGC SensorThings API** data standard |
 
+## Google & public-data stack
+
+| Recommended tool | How PranaWatch uses it | Status |
+|---|---|---|
+| Gemini API (Google AI Studio) | Writes evidence-backed alerts for the responsible agency | Live |
+| Gemini multimodal | Classifies citizen pollution photos (source + severity) | Live |
+| Gemini speech | Spoken advisories in English, Kannada, Hindi (🔊 Voice) | Live (needs key) |
+| Google Earth Engine | Sentinel-5P NO₂ and FIRMS fire detections | Live |
+| BigQuery | "Save snapshot to BigQuery": city snapshots + alerts for trend analysis (free sandbox) | Optional |
+| Cloud Run | `Dockerfile` included: `gcloud run deploy pranawatch --source .` | Ready (needs billing) |
+| data.gov.in (CPCB) | Official ground monitors on the map; validates CAMS city values | Live (free key) |
+| Vertex AI | Gemini client falls back to Vertex AI express keys; forecasting models move to Vertex AI at scale | Scale-up path |
+
 ## Architecture
 
 ```
@@ -63,9 +76,13 @@ The app works immediately with no keys. Each missing service falls back automati
 - **NASA FIRMS key (optional, free, instant):** get one at https://firms.modaps.eosdis.nasa.gov/api/map_key and add
   `FIRMS_MAP_KEY = "..."` to secrets for live fire detections across India. Without it, a clearly labelled simulated
   early-season stubble-fire pattern is used.
+- **data.gov.in key (optional, free):** register at https://data.gov.in, then My Account → API key, and add
+  `DATA_GOV_IN_KEY = "..."`. Adds official CPCB ground stations to the India map and validates CAMS against them.
+- **BigQuery (optional, free sandbox):** with `EE_PROJECT` set and `earthengine authenticate` done, the India tab
+  shows **Save snapshot to BigQuery** (dataset `pranawatch`). No billing needed.
 - **Offline.** If Open-Meteo is unreachable, a built-in demo dataset is used, so the demo never breaks.
 
-Run the tests with `pip install pytest && pytest -q` (11 tests, including a headless UI test of every tab).
+Run the tests with `pip install pytest && pytest -q` (14 tests, including a headless UI test of every tab).
 
 ## Deploy (free, about 5 minutes)
 
@@ -89,6 +106,9 @@ core/gemini.py             Gemini photo classification + multilingual alerts
 core/federated.py          FedAvg simulation across 3 BRICS cities
 core/sensorthings.py       OGC SensorThings API export
 core/national.py           All-India screening: 38 cities, CAMS forecast, fire-smoke transport
+core/cpcb.py               CPCB real-time stations from data.gov.in + validation
+core/bq.py                 BigQuery export (sandbox-friendly)
+Dockerfile                 Cloud Run deployment
 firmware/                  ESP32 node firmware (PMS5003 + BME280)
 tests/                     Unit + headless UI tests
 ```

@@ -11,6 +11,7 @@ if not exist .venv (
   python -m pip install -r requirements.txt || (echo Install failed & pause & exit /b 1)
 ) else (
   call .venv\Scripts\activate.bat
+  python -m pip install -q -r requirements.txt
 )
 echo.
 echo Checking Gemini key...
