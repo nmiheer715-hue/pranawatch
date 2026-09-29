@@ -1,0 +1,551 @@
+"""PranaWatch - AI-powered hyperlocal air-quality early-warning platform.
+Code for Communities 2.0 | Track 2: Clean Air & Climate Resilience
+
+Run:  streamlit run app.py
+"""
+from __future__ import annotations
+
+import json
+import os
+
+import folium
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from folium.plugins import HeatMap
+from streamlit_folium import st_folium
+
+from core import calibration, config, data, federated, forecast, gemini, hotspots, national, satellite, sensorthings
+
+st.set_page_config(page_title="PranaWatch", page_icon="🌬️", layout="wide")
+
+
+# ---------------------------------------------------------------------------
+# Secrets -> env (works locally with .env-style env vars and on Streamlit Cloud)
+# ---------------------------------------------------------------------------
+def _load_secrets():
+    try:
+        for k in ("GEMINI_API_KEY", "GEMINI_MODEL", "EE_PROJECT", "FIRMS_MAP_KEY"):
+            if k in st.secrets and not os.environ.get(k):
+                os.environ[k] = str(st.secrets[k])
+    except Exception:
+        pass
+
+
+_load_secrets()
+
+
+# ---------------------------------------------------------------------------
+# Cached pipeline
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner="Loading air-quality and weather data…")
+def get_data(prefer_live: bool):
+    ds = data.load_dataset(prefer_live=prefer_live)
+    obs, cal_metrics = calibration.calibrate(ds.obs, ds.weather)
+    ds.obs = obs
+    return ds, cal_metrics
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching satellite layers…")
+def get_satellite(use_gee: bool):
+    return satellite.load_layers(use_gee=use_gee)
+
+
+@st.cache_data(ttl=3600, show_spinner="Training forecast model…")
+def get_forecast(_ds, node_id: str, horizon: int, key: str):
+    ser = _ds.obs[_ds.obs["node_id"] == node_id].set_index("time")["pm25_cal"].asfreq("h").interpolate()
+    band, bt = forecast.forecast_node(ser, _ds.weather, horizon=horizon)
+    return ser, band, bt
+
+
+@st.cache_data(show_spinner="Running federated learning rounds across BRICS cities…")
+def get_federated():
+    return federated.run()
+
+
+@st.cache_data(ttl=1800, show_spinner="Loading all-India air quality and fire data…")
+def get_national(prefer_live: bool, use_gee: bool):
+    return national.load(prefer_live=prefer_live, use_gee=use_gee)
+
+
+def seed_reports():
+    s1 = next(s for s in config.SOURCES if s["kind"] == "industrial")
+    s3 = next(s for s in config.SOURCES if s["kind"] == "construction")
+    return [
+        {"id": "R-101", "lat": s1["lat"] - 0.001, "lon": s1["lon"] + 0.0015, "category": "industrial",
+         "confidence": 0.86, "severity": 4, "description": "Dark grey plume from a foundry chimney (demo report)",
+         "source": "demo", "time": "earlier today"},
+        {"id": "R-102", "lat": s3["lat"] + 0.0008, "lon": s3["lon"] - 0.001, "category": "construction",
+         "confidence": 0.79, "severity": 3, "description": "Uncovered debris and dust near flyover works (demo report)",
+         "source": "demo", "time": "yesterday"},
+    ]
+
+
+if "reports" not in st.session_state:
+    st.session_state.reports = seed_reports()
+if "alerts" not in st.session_state:
+    st.session_state.alerts = []
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.title("🌬️ PranaWatch")
+    st.caption("Hyperlocal air-quality intelligence\n\nCode for Communities 2.0 · Track 2")
+    prefer_live = st.toggle("Use live Open-Meteo data", value=True,
+                            help="Regional CAMS air quality + weather. Falls back to demo data if offline.")
+    use_gee = st.toggle("Use Google Earth Engine", value=bool(os.environ.get("EE_PROJECT")),
+                        help="Needs `earthengine authenticate` and EE_PROJECT set.")
+    if not gemini.available():
+        k = st.text_input("Gemini API key", type="password", help="Free key: aistudio.google.com/apikey")
+        if k:
+            os.environ["GEMINI_API_KEY"] = k.strip()
+            st.rerun()
+    if st.button("🔄 Refresh data"):
+        st.cache_data.clear()
+        st.rerun()
+
+ds, cal_metrics = get_data(prefer_live)
+sat = get_satellite(use_gee)
+hs = hotspots.detect_hotspots(ds.obs, ds.now)
+wx_now = ds.weather.loc[ds.now] if ds.now in ds.weather.index else ds.weather.iloc[0]
+
+with st.sidebar:
+    st.divider()
+    st.markdown("**System status**")
+    st.markdown(f"- Weather + regional AQ: {'🟢 live (Open-Meteo)' if ds.mode == 'live' else '🟡 demo dataset'}")
+    st.markdown(f"- Satellite: {'🟢 Earth Engine' if sat['mode'] == 'gee' else '🟡 simulated layer'}")
+    st.markdown(f"- Gemini: {'🟢 connected' if gemini.available() else '🟡 template mode (add key)'}")
+    st.markdown("- Street-level nodes: 🟡 simulated (hardware in design)")
+    if sat.get("error") and use_gee:
+        st.caption(f"GEE: {sat['error']}")
+    st.caption(f"Last observation: {ds.now:%d %b %Y, %H:%M} IST")
+
+
+# ---------------------------------------------------------------------------
+# Header KPIs
+# ---------------------------------------------------------------------------
+st.title("PranaWatch · India air-quality early warning")
+st.caption("National screening of 38 cities with live CAMS data and fire-smoke tracking, then street-level "
+           "intelligence where sensors are deployed (pilot: Peenya, Bengaluru). Finds hidden hotspots, forecasts "
+           "spikes, and alerts the right authority.")
+
+
+def corridor_kpis():
+    pw = hs[hs["type"] == "pranawatch"]
+    worst = pw.sort_values("pm25", ascending=False).iloc[0]
+    aqi_w, cat_w = config.pm25_to_aqi(worst["pm25"])
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Corridor median PM2.5", f"{hs['network_median'].iloc[0]:.0f} µg/m³")
+    c2.metric(f"Worst: {worst['name']}", f"AQI {aqi_w}", cat_w, delta_color="off")
+    c3.metric("Active hotspots", int(hs["hotspot"].sum()))
+    c4.metric("Wind", f"{wx_now['wind_speed']:.1f} m/s", f"from {wx_now['wind_dir']:.0f}°", delta_color="off")
+    c5.metric("Mixing height", f"{wx_now['blh']:.0f} m", "stagnant" if wx_now["blh"] < 400 else "ventilated",
+              delta_color="off")
+
+
+tabs_all = st.tabs(["🇮🇳 India overview", "🗺️ Peenya live map", "🔥 Hotspots & alerts", "📈 Forecast",
+                    "📸 Citizen reports", "🔧 Sensor calibration", "🌍 BRICS federation", "ℹ️ About"])
+india_tab, tabs = tabs_all[0], tabs_all[1:]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def hotspot_context(row) -> dict:
+    enh = satellite.no2_enhancement_at(sat["no2"], row["lat"], row["lon"])
+    ranked = hotspots.attribute(row.to_dict(), wx_now["wind_dir"], wx_now["wind_speed"], row["ratio"], enh,
+                                sat["fires"], st.session_state.reports)
+    return {"node_id": row["id"], "node_name": row["name"], "lat": row["lat"], "lon": row["lon"],
+            "pm25": row["pm25"], "pm10": row["pm10"], "excess": row["excess"], "ratio": row["ratio"],
+            "z": row["z"], "no2_enh": enh, "ranked": ranked, "top_source": ranked[0],
+            "wind": {"from_deg": round(float(wx_now["wind_dir"])), "speed_ms": round(float(wx_now["wind_speed"]), 1)},
+            "reports": [{k: r[k] for k in ("category", "description", "confidence")} for r in st.session_state.reports]}
+
+
+# ---------------------------------------------------------------------------
+# Tab 0 - India overview (national screening)
+# ---------------------------------------------------------------------------
+with india_tab:
+    nat = get_national(prefer_live, use_gee)
+    ns = nat["summary"].copy()
+    fire_label = {"firms": "🟢 NASA FIRMS (live)", "gee": "🟢 Earth Engine FIRMS (live)",
+                  "simulated": "🟡 simulated early-season pattern (demo)",
+                  "none": "⚪ no live fire feed: add a free FIRMS_MAP_KEY to enable smoke tracking"}[nat["fire_mode"]]
+    st.caption(f"Air quality: {'🟢 live CAMS via Open-Meteo' if nat['mode'] == 'live' else '🟡 demo dataset'} · "
+               f"Fires: {fire_label} · as of {nat['now']:%d %b %Y %H:%M} IST · AQI = India NAQI from 24-h mean PM2.5")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Cities monitored", len(ns))
+    k2.metric("'Poor' or worse now", int((ns["pm25_24h"] >= 91).sum()))
+    k3.metric("Forecast 'Poor'+ in 48 h", int((ns["fc_24h_peak"] >= 91).sum()),
+              f"{int(((ns['fc_24h_peak'] >= 91) & (ns['pm25_24h'] < 91)).sum())} newly", delta_color="inverse")
+    k4.metric("Cities in smoke path", int(ns["smoke_flag"].sum()))
+    k5.metric("Active fires detected", len(nat["fires"]))
+
+    left, right = st.columns([3, 2])
+    with left:
+        color_by = st.radio("Colour cities by", ["Now (24-h mean)", "48-h forecast peak"], horizontal=True)
+        mi = folium.Map(location=[22.5, 80.0], zoom_start=5, tiles="OpenStreetMap")
+        fg = folium.FeatureGroup(name="Fires")
+        for f in nat["fires"][:1500]:
+            folium.CircleMarker([f["lat"], f["lon"]], radius=2, color="#e65100", fill=True, fill_opacity=0.8,
+                                weight=0, tooltip=f"Active fire ({f['source']})").add_to(fg)
+        fg.add_to(mi)
+        for _, r in ns.iterrows():
+            v = r["pm25_24h"] if color_by.startswith("Now") else r["fc_24h_peak"]
+            aqi, cat = config.pm25_to_aqi(v)
+            if r["smoke_flag"] and r["fire_centroid"]:
+                folium.PolyLine([r["fire_centroid"], [r["lat"], r["lon"]]], color="#6d4c41", weight=2,
+                                dash_array="5", opacity=0.7,
+                                tooltip=f"Smoke transport → {r['city']}").add_to(mi)
+            folium.CircleMarker(
+                [r["lat"], r["lon"]], radius=6 + min(v, 250) / 18,
+                color="black" if r["smoke_flag"] else "white", weight=2.5 if r["smoke_flag"] else 1,
+                fill=True, fill_color=config.AQI_COLORS[cat], fill_opacity=0.9,
+                tooltip=(f"{r['city']}: PM2.5 {v:.0f} · AQI {aqi} {cat}"
+                         + (f" · 🔥 {int(r['upwind_fires'])} fires upwind" if r["smoke_flag"] else "")),
+            ).add_to(mi)
+        st_folium(mi, height=620, use_container_width=True, returned_objects=[], key="india_map")
+    with right:
+        st.markdown("**Early-warning watchlist**")
+        wl = ns.sort_values("fc_24h_peak", ascending=False)[
+            ["city", "pm25_24h", "fc_24h_peak", "fc_category", "smoke_flag"]].rename(columns={
+                "pm25_24h": "now", "fc_24h_peak": "48h peak", "fc_category": "forecast", "smoke_flag": "🔥"})
+        st.dataframe(wl.round(0), use_container_width=True, hide_index=True, height=560)
+
+    st.divider()
+    cities = ns.sort_values("fc_24h_peak", ascending=False)["city"].tolist()
+    csel = st.selectbox("City detail & alert", cities, index=0)
+    row = ns[ns["city"] == csel].iloc[0]
+    g = nat["aq"][nat["aq"]["city"] == csel].set_index("time").sort_index()
+    g = g[g.index <= nat["now"] + pd.Timedelta(hours=48)]
+    a, b = st.columns([3, 2])
+    with a:
+        figc = go.Figure()
+        past, fut = g[g.index <= nat["now"]], g[g.index >= nat["now"]]
+        figc.add_trace(go.Scatter(x=past.index, y=past["pm25"], name="PM2.5 (CAMS analysis)",
+                                  line=dict(color="#1565c0")))
+        figc.add_trace(go.Scatter(x=fut.index, y=fut["pm25"], name="PM2.5 forecast",
+                                  line=dict(color="#d32f2f", dash="dash")))
+        figc.add_trace(go.Scatter(x=g.index, y=g["pm25"].rolling(24, min_periods=12).mean(), name="24-h mean (NAQI)",
+                                  line=dict(color="#6a1b9a", width=3)))
+        figc.add_hline(y=config.ALERT_THRESHOLD_PM25, line_dash="dot", line_color="#f57c00",
+                       annotation_text="'Poor' (24-h mean > 90)")
+        figc.add_vline(x=nat["now"], line_color="gray")
+        figc.update_layout(height=340, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="PM2.5 (µg/m³)",
+                           legend=dict(orientation="h", y=1.12))
+        st.plotly_chart(figc, use_container_width=True)
+    with b:
+        ctx_c = national.alert_context(row, ns)
+        st.markdown(f"**{csel}{'' if row['state'] == csel else ', ' + row['state']}**: now AQI {row['aqi']} ({row['category']}), "
+                    f"48-h forecast peak AQI {row['fc_aqi']} ({row['fc_category']})")
+        st.markdown(f"**Likely driver:** {ctx_c['top_source']['name']}  \n**Notify:** {ctx_c['top_source']['authority']}")
+        for e in ctx_c["top_source"]["evidence"]:
+            st.markdown(f"- {e}")
+        if csel == "Bengaluru":
+            st.info("🔎 Bengaluru has a street-level pilot: open the **Peenya** tabs to see hidden hotspots the "
+                    "city-level number misses.")
+        if st.button(f"✉️ Generate alert with Gemini: {csel}", key=f"nat-alert-{csel}"):
+            with st.spinner("Gemini is drafting the alert…"):
+                al = gemini.write_alert(ctx_c)
+            al["node"] = f"city:{csel}"
+            st.session_state.alerts.insert(0, al)
+    for al in [x for x in st.session_state.alerts if x.get("node") == f"city:{csel}"][:1]:
+        st.info(f"**To:** {al.get('authority')}  \n**Subject:** {al.get('subject')}  \n"
+                f"**Priority:** {al.get('priority')}\n\n{al.get('authority_message')}")
+        adv = al.get("public_advisory", {})
+        l1, l2, l3 = st.columns(3)
+        l1.markdown(f"**English**  \n{adv.get('en', '')}")
+        l2.markdown(f"**ಕನ್ನಡ**  \n{adv.get('kn', '')}")
+        l3.markdown(f"**हिन्दी**  \n{adv.get('hi', '')}")
+        st.caption(f"Generated by: {al.get('_model')}")
+
+# ---------------------------------------------------------------------------
+# Tab 1 - Map
+# ---------------------------------------------------------------------------
+with tabs[0]:
+    st.caption(f"Hyperlocal pilot · {config.CORRIDOR_NAME}, Bengaluru")
+    corridor_kpis()
+    left, right = st.columns([3, 1])
+    with right:
+        show_no2 = st.checkbox("Sentinel-5P NO₂ layer", True)
+        show_src = st.checkbox("Known emission sources", True)
+        show_rep = st.checkbox("Citizen reports", True)
+        show_traj = st.checkbox("Back-trajectories for hotspots", True)
+        st.markdown("**AQI legend (India NAQI)**")
+        for cat, col in config.AQI_COLORS.items():
+            if cat != "Unknown":
+                st.markdown(f"<span style='color:{col}'>●</span> {cat}", unsafe_allow_html=True)
+    with left:
+        m = folium.Map(location=config.CENTER, zoom_start=14, tiles="OpenStreetMap")
+        if show_no2:
+            if sat.get("tile"):
+                folium.TileLayer(tiles=sat["tile"], attr="Google Earth Engine / Copernicus", name="NO₂",
+                                 opacity=0.55, overlay=True).add_to(m)
+            else:
+                import branca.colormap as bcm
+                n2 = sat["no2"]
+                lats = np.sort(n2["lat"].unique())
+                half = (np.median(np.diff(lats)) if len(lats) > 1 else 0.005) / 2
+                cmap = bcm.LinearColormap(["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"],
+                                          vmin=float(n2["no2"].quantile(0.05)), vmax=float(n2["no2"].quantile(0.98)),
+                                          caption="Tropospheric NO₂ (µmol/m²)" +
+                                                  ("" if sat["mode"] == "gee" else ", simulated"))
+                layer = folium.FeatureGroup(name="NO₂")
+                for la, lo, v in zip(n2["lat"], n2["lon"], n2["no2"]):
+                    folium.Rectangle([[la - half, lo - half], [la + half, lo + half]], stroke=False,
+                                     fill=True, fill_color=cmap(v), fill_opacity=0.38).add_to(layer)
+                layer.add_to(m)
+                cmap.add_to(m)
+        for f in sat["fires"]:
+            folium.Marker([f["lat"], f["lon"]], tooltip=f"🔥 Active fire ({f['source']})",
+                          icon=folium.Icon(color="red", icon="fire", prefix="fa")).add_to(m)
+        if show_src:
+            for s in config.SOURCES:
+                folium.Marker([s["lat"], s["lon"]], tooltip=f"{s['name']} [{s['kind']}]",
+                              icon=folium.Icon(color="gray", icon="industry", prefix="fa")).add_to(m)
+        if show_rep:
+            for r in st.session_state.reports:
+                folium.Marker([r["lat"], r["lon"]], tooltip=f"📸 {r['category']}: {r['description']}",
+                              icon=folium.Icon(color="purple", icon="camera", prefix="fa")).add_to(m)
+        for _, r in hs.iterrows():
+            aqi, cat = config.pm25_to_aqi(r["pm25"])
+            folium.CircleMarker(
+                [r["lat"], r["lon"]], radius=16 if r["hotspot"] else 11,
+                color="black" if r["hotspot"] else "white", weight=3 if r["hotspot"] else 1,
+                fill=True, fill_color=config.AQI_COLORS[cat], fill_opacity=0.9,
+                tooltip=f"{r['name']} ({r['id']}): PM2.5 {r['pm25']:.0f} · AQI {aqi} {cat}"
+                        + (" · ⚠️ HOTSPOT" if r["hotspot"] else ""),
+            ).add_to(m)
+            if show_traj and r["hotspot"]:
+                pts = hotspots.back_trajectory(r["lat"], r["lon"], ds.weather, ds.now, hours=3)
+                folium.PolyLine(pts, color="#d32f2f", weight=3, dash_array="6", tooltip="3-h back-trajectory").add_to(m)
+        # wind arrow
+        wd = np.radians(wx_now["wind_dir"])
+        lat0, lon0 = 13.072, 77.478
+        folium.PolyLine([[lat0 + 0.006 * np.cos(wd), lon0 + 0.006 * np.sin(wd)], [lat0, lon0]], color="#1565c0",
+                        weight=4, tooltip=f"Wind from {wx_now['wind_dir']:.0f}° at {wx_now['wind_speed']:.1f} m/s").add_to(m)
+        folium.CircleMarker([lat0, lon0], radius=4, color="#1565c0", fill=True).add_to(m)
+        st_folium(m, height=560, use_container_width=True, returned_objects=[])
+
+# ---------------------------------------------------------------------------
+# Tab 2 - Hotspots & alerts
+# ---------------------------------------------------------------------------
+with tabs[1]:
+    st.subheader("Hidden hotspot detection")
+    st.caption("A node is flagged when its calibrated PM2.5 (3-h mean) is ≥2 robust standard deviations and "
+               "≥15 µg/m³ above the corridor median: pollution the city-level monitors average away.")
+    view = hs.copy()
+    view["AQI"] = view["pm25"].apply(lambda v: config.pm25_to_aqi(v)[0])
+    view["category"] = view["pm25"].apply(lambda v: config.pm25_to_aqi(v)[1])
+    st.dataframe(
+        view[["id", "name", "pm25", "pm10", "AQI", "category", "excess", "z", "ratio", "fingerprint", "hotspot"]]
+        .sort_values("z", ascending=False).round(2),
+        use_container_width=True, hide_index=True)
+
+    hot = hs[hs["hotspot"]]
+    if hot.empty:
+        st.success("No hotspots right now.")
+    for _, row in hot.iterrows():
+        ctx = hotspot_context(row)
+        st.markdown(f"### ⚠️ {row['name']} ({row['id']}): PM2.5 {row['pm25']:.0f} µg/m³, "
+                    f"+{row['excess']:.0f} above corridor")
+        a, b = st.columns([2, 3])
+        with a:
+            st.markdown("**Source attribution**")
+            rk = pd.DataFrame(ctx["ranked"])
+            fig = go.Figure(go.Bar(x=rk["confidence"] * 100, y=rk["name"], orientation="h",
+                                   marker_color=["#d32f2f"] + ["#90a4ae"] * (len(rk) - 1)))
+            fig.update_layout(height=230, margin=dict(l=0, r=10, t=10, b=0), xaxis_title="confidence %",
+                              yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig, use_container_width=True)
+        with b:
+            top = ctx["top_source"]
+            st.markdown(f"**Most likely source:** {top['name']}  \n**Notify:** {top['authority']}")
+            st.markdown("**Evidence fused:**")
+            for e in top["evidence"] or ["network anomaly only"]:
+                st.markdown(f"- {e}")
+        # attach forecast peak for the alert
+        _, band, _ = get_forecast(ds, row["id"], 24, f"{ds.mode}-{ds.now}")
+        pk_t = band["forecast"].idxmax()
+        ctx["forecast_peak"] = {"time": f"{pk_t:%d %b %H:%M}", "value": round(float(band['forecast'].max()), 1)}
+        if st.button(f"✉️ Generate alert with Gemini: {row['id']}", key=f"alert-{row['id']}"):
+            with st.spinner("Gemini is drafting the alert…"):
+                al = gemini.write_alert(ctx)
+            al["node"] = row["id"]
+            st.session_state.alerts.insert(0, al)
+        for al in [x for x in st.session_state.alerts if x.get("node") == row["id"]][:1]:
+            st.info(f"**To:** {al.get('authority')}  \n**Subject:** {al.get('subject')}  \n"
+                    f"**Priority:** {al.get('priority')}\n\n{al.get('authority_message')}")
+            adv = al.get("public_advisory", {})
+            l1, l2, l3 = st.columns(3)
+            l1.markdown(f"**English**  \n{adv.get('en', '')}")
+            l2.markdown(f"**ಕನ್ನಡ**  \n{adv.get('kn', '')}")
+            l3.markdown(f"**हिन्दी**  \n{adv.get('hi', '')}")
+            st.caption(f"Generated by: {al.get('_model')}")
+            st.download_button("⬇️ Download alert (JSON)", json.dumps(al, ensure_ascii=False, indent=2),
+                               file_name=f"alert_{row['id']}.json", key=f"dl-{row['id']}")
+
+# ---------------------------------------------------------------------------
+# Tab 3 - Forecast
+# ---------------------------------------------------------------------------
+with tabs[2]:
+    names = {n["id"]: f"{n['name']} ({n['id']})" for n in config.NODES}
+    default = hot["id"].iloc[0] if not hot.empty else "PW-01"
+    c_a, c_b = st.columns([2, 1])
+    node_sel = c_a.selectbox("Node", list(names), index=list(names).index(default), format_func=names.get)
+    horizon = c_b.radio("Horizon", [24, 48], horizontal=True)
+    ser, band, bt = get_forecast(ds, node_sel, horizon, f"{ds.mode}-{ds.now}")
+    hist = ser[ser.index > ds.now - pd.Timedelta(hours=72)]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=band.index, y=band["hi"], line=dict(width=0), showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=band.index, y=band["lo"], fill="tonexty", fillcolor="rgba(211,47,47,0.15)",
+                             line=dict(width=0), name="80% interval"))
+    fig.add_trace(go.Scatter(x=hist.index, y=hist.values, name="Observed (calibrated)", line=dict(color="#1565c0")))
+    fig.add_trace(go.Scatter(x=band.index, y=band["forecast"], name="Forecast",
+                             line=dict(color="#d32f2f", dash="dash")))
+    fig.add_hline(y=config.ALERT_THRESHOLD_PM25, line_dash="dot", line_color="#f57c00",
+                  annotation_text="'Poor' threshold (91 µg/m³)")
+    fig.add_vline(x=ds.now, line_color="gray")
+    fig.update_layout(height=420, margin=dict(l=0, r=0, t=20, b=0), yaxis_title="PM2.5 (µg/m³)",
+                      legend=dict(orientation="h", y=1.08))
+    st.plotly_chart(fig, use_container_width=True)
+    exceed = band[band["forecast"] >= config.ALERT_THRESHOLD_PM25]
+    if not exceed.empty:
+        st.warning(f"⚠️ Forecast: PM2.5 above 'Poor' threshold for {len(exceed)} of the next {len(band)} hours, "
+                   f"peaking at {band['forecast'].max():.0f} µg/m³ around {band['forecast'].idxmax():%d %b %H:%M}. "
+                   f"Early-warning advisory recommended.")
+    else:
+        st.success("No 'Poor' hours forecast in this window.")
+    if bt:
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Model MAE (24 h)", f"{bt['mae_model']:.1f} µg/m³")
+        k2.metric("Persistence MAE", f"{bt['mae_persistence']:.1f} µg/m³")
+        k3.metric("Same-hour-yesterday MAE", f"{bt['mae_yesterday']:.1f} µg/m³")
+        k4.metric("Skill vs persistence", f"{bt['skill_vs_persistence']*100:.0f}%")
+        st.caption(f"Rolling-origin backtest over the last 5 days ({bt['n_origins']} forecast runs). Model: gradient-"
+                   "boosted trees on lagged PM2.5, humidity, wind vector, boundary-layer height and ventilation index.")
+
+# ---------------------------------------------------------------------------
+# Tab 4 - Citizen reports
+# ---------------------------------------------------------------------------
+with tabs[3]:
+    st.subheader("Report pollution with a photo")
+    st.caption("Gemini's multimodal model reads the photo, identifies the likely source and severity, and the "
+               "report becomes evidence in the attribution engine.")
+    up = st.file_uploader("Photo of smoke / dust / burning", type=["jpg", "jpeg", "png", "webp"])
+    near = st.selectbox("Where was it taken?", [n["id"] for n in config.NODES if n["type"] == "pranawatch"],
+                        format_func=lambda i: f"near {names[i]}")
+    manual = None
+    if not gemini.available():
+        st.info("Gemini key not set: choose the category manually (with a key, Gemini classifies automatically).")
+        manual = st.selectbox("Category", gemini.CATEGORIES[:-1])
+    if up and st.button("Submit report"):
+        node = next(n for n in config.NODES if n["id"] == near)
+        if gemini.available():
+            with st.spinner("Gemini is analysing the photo…"):
+                try:
+                    res = gemini.classify_photo(up.getvalue(), up.type or "image/jpeg")
+                except Exception as e:
+                    st.error(f"Gemini error: {e}")
+                    res = None
+        else:
+            res = {"category": manual, "confidence": 0.6, "severity": 3, "description": "Manually labelled report",
+                   "_model": "manual"}
+        if res:
+            rep = {"id": f"R-{200 + len(st.session_state.reports)}", "lat": node["lat"] + 0.001,
+                   "lon": node["lon"] + 0.001, "category": res.get("category"),
+                   "confidence": res.get("confidence", 0.5), "severity": res.get("severity"),
+                   "description": res.get("description", ""), "source": res.get("_model"), "time": "just now"}
+            st.session_state.reports.insert(0, rep)
+            st.image(up, width=320)
+            st.success(f"Classified as **{rep['category']}** (confidence {rep['confidence']:.0%}, "
+                       f"severity {rep['severity']}/5): {rep['description']}")
+            if res.get("visible_evidence"):
+                st.write("Visible evidence:", ", ".join(res["visible_evidence"]))
+    st.markdown("#### Report feed")
+    st.dataframe(pd.DataFrame(st.session_state.reports)[["id", "category", "confidence", "severity", "description",
+                                                         "time", "source"]],
+                 use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# Tab 5 - Calibration
+# ---------------------------------------------------------------------------
+with tabs[4]:
+    st.subheader("Low-cost sensor calibration")
+    st.caption("Optical PM sensors over-read in humid air (particles absorb water). Each node is co-located with "
+               "a CPCB reference monitor for 7 days, then a per-node humidity-aware model corrects every reading.")
+    cm = cal_metrics.copy()
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Mean error, raw sensor", f"{cm['mae_raw'].mean():.1f} µg/m³")
+    k2.metric("Mean error, calibrated", f"{cm['mae_cal'].mean():.1f} µg/m³",
+              f"-{(1 - cm['mae_cal'].mean() / cm['mae_raw'].mean()) * 100:.0f}%", delta_color="inverse")
+    k3.metric("R² calibrated", f"{cm['r2_cal'].mean():.2f}")
+    nsel = st.selectbox("Node ", cm["node_id"].tolist())
+    g = ds.obs[(ds.obs["node_id"] == nsel) & (ds.obs["time"] > ds.now - pd.Timedelta(days=4))]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=g["time"], y=g["pm25_raw"], name="Raw PMS5003", line=dict(color="#bdbdbd")))
+    fig.add_trace(go.Scatter(x=g["time"], y=g["pm25_true"], name="Reference-grade", line=dict(color="#2e7d32")))
+    fig.add_trace(go.Scatter(x=g["time"], y=g["pm25_cal"], name="PranaWatch calibrated",
+                             line=dict(color="#1565c0", dash="dot")))
+    fig.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="PM2.5 (µg/m³)",
+                      legend=dict(orientation="h", y=1.1))
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(cm.round(2), use_container_width=True, hide_index=True)
+    st.caption("Street-level nodes are simulated on top of the live regional background until the hardware is "
+               "deployed; the calibration method is identical for real data.")
+
+# ---------------------------------------------------------------------------
+# Tab 6 - BRICS federation
+# ---------------------------------------------------------------------------
+with tabs[5]:
+    st.subheader("Federated learning across BRICS cities")
+    st.caption("Each city trains on its own data; only model weights travel (FedAvg). Raw citizen and sensor data "
+               "never leave the country, which makes cross-border model sharing politically and legally feasible.")
+    fr = get_federated()
+    summ = fr["summary"].copy()
+    st.dataframe(summ.round(2), use_container_width=True, hide_index=True)
+    new = summ.iloc[-1]
+    gain = (1 - new["mae_federated"] / new["mae_local_only"]) * 100
+    st.info(f"**{new['city']}** joined with only {int(new['train_samples'])} hours of data. The federated model "
+            f"reduces its error by **{gain:.0f}%** vs training alone, with no raw data exchanged.")
+    hist_df = fr["history"].set_index("round")
+    fig = go.Figure([go.Scatter(x=hist_df.index, y=hist_df[c], name=c) for c in hist_df.columns])
+    fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="federation round",
+                      yaxis_title="test MAE (µg/m³)")
+    st.plotly_chart(fig, use_container_width=True)
+    st.markdown("#### Interoperability: OGC SensorThings API")
+    st.caption("Every node and reading is published in the open OGC SensorThings format, so any city's sensors "
+               "can join without custom integration.")
+    ex_node = next(n for n in config.NODES if n["id"] == "PW-01")
+    st.json({"Thing": sensorthings.thing(ex_node), "Observations (latest 3)":
+             sensorthings.observations(ds.obs, "PW-01", last_n=3)}, expanded=False)
+
+# ---------------------------------------------------------------------------
+# Tab 7 - About
+# ---------------------------------------------------------------------------
+with tabs[6]:
+    st.markdown("""
+### How PranaWatch works
+**Problem.** City monitors report macro-level AQI; a foundry, a burning waste pile or a construction site 500 m
+away is averaged out. Satellites see the region but at km-scale pixels. The street is blind.
+
+**Pipeline**
+1. **Sense.** Low-cost ESP32 + PMS5003 + BME280 nodes (custom KiCad PCB) stream PM1/2.5/10, humidity and temperature.
+2. **Calibrate.** Humidity-aware per-node correction against a CPCB reference (error −90%+).
+3. **Fuse.** Sentinel-5P NO₂ and NASA FIRMS fires (Google Earth Engine) plus Open-Meteo weather and regional CAMS
+   air quality, plus citizen photos classified by Gemini.
+4. **Detect.** Robust network-anomaly detection finds hidden hotspots.
+5. **Attribute.** Upwind geometry + PM2.5/PM10 fingerprint + satellite + citizen evidence identify the likely source.
+6. **Forecast.** Gradient-boosted 24–48 h PM2.5 forecast with uncertainty, backtested vs baselines.
+7. **Act.** Gemini writes an evidence-backed alert to the responsible agency (KSPCB / BBMP / Traffic Police) and a
+   public advisory in English, Kannada and Hindi.
+8. **Federate.** FedAvg shares models (not data) across BRICS cities over the OGC SensorThings standard.
+
+**Google stack:** Gemini (multimodal classification + alert generation), Google Earth Engine (Sentinel-5P, FIRMS),
+deployable on Cloud Run with BigQuery for storage at scale.
+
+**Honest status:** regional background & weather are live; street-level node readings are simulated with a plume
+model until the hardware nodes are deployed.
+""")

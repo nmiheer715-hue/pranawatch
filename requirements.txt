@@ -1,0 +1,12 @@
+streamlit>=1.40
+streamlit-folium>=0.22
+folium>=0.17
+plotly>=5.20
+pandas>=2.1
+numpy>=1.26
+scikit-learn>=1.4
+requests>=2.31
+google-genai>=1.0
+pillow>=10.0
+# optional: live satellite layers
+earthengine-api>=1.0
